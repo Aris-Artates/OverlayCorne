@@ -26,29 +26,46 @@ fix the HID permissions below.**
 Status dot in the header: 🟢 `HID` = matrix mode, 🟠 `OS` = hook fallback,
 🔴 `LKD`/`--` = board locked / not found.
 
-## Install & run: Fedora / Linux
+## Install & run: Linux (Fedora / Debian / Ubuntu / Arch)
+
+One-time setup — installs the dependencies and the udev rules, then reloads
+udev:
+
+```bash
+sudo scripts/install.sh              # add --autostart for launch-on-plug
+# unplug/replug the keyboard, then run AS YOUR NORMAL USER:
+python3 overlay_corne.py
+```
+
+Do **not** launch the overlay itself with `sudo`: root's Python won't see your
+pip-installed `hidapi`, so the overlay silently degrades to hook mode — and
+the GUI, config and pidfile all end up owned by root. The udev rule makes
+sudo unnecessary.
+
+<details>
+<summary>Manual steps (what install.sh does, Fedora naming)</summary>
 
 ```bash
 sudo dnf install python3 python3-tkinter python3-evdev python3-pip
-pip install --user hidapi
+pip install --user hidapi            # if python3-hidapi isn't packaged
 
 # HID + evdev access for the board (one-time; do NOT run the overlay as root)
 sudo install -m0644 udev/70-vial.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
 # now unplug/replug the keyboard, then verify:
 getfacl /dev/hidraw* 2>/dev/null | grep -B3 "user:$USER"   # expect rw on the W-CORNE nodes
-
-python3 overlay_corne.py
 ```
 
-Do **not** launch with `sudo`: root's Python won't see your pip-installed
-`hidapi`, so the overlay silently degrades to hook mode — and the GUI, config
-and pidfile all end up owned by root. The udev rule makes sudo unnecessary.
+On Debian/Ubuntu the packages are `python3-tk python3-evdev python3-hidapi`;
+on Arch `tk python-evdev python-hidapi`.
+</details>
 
 `udev/70-vial.rules` grants your logged-in session access to the Vial hidraw
 interface and to the W-CORNE's evdev nodes only (deliberately not the broad
 `input` group, which would let every app read every input device — i.e.
-keylogging-wide access).
+keylogging-wide access). The `70-` prefix is load-bearing: `TAG+="uaccess"`
+is processed by systemd's `73-seat-late.rules`, so a `99-*.rules` copy of the
+same rules would be silently ignored.
 
 ## Install & run: Windows
 
