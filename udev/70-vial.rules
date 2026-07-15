@@ -1,0 +1,21 @@
+# OverlayCorne / Vial udev rules.  Install with:
+#   sudo install -m0644 udev/70-vial.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+# then unplug/replug the keyboard.
+#
+# NOTE: keep the filename number below 73 — TAG+="uaccess" is processed by
+# systemd's 73-seat-late.rules, so a 99-*.rules copy is silently ignored.
+
+# Raw HID access for Vial keyboards (overlay matrix polling; also used by the
+# Vial GUI).  Matches any board built with Vial firmware.
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{serial}=="*vial:f64c2b3c*", MODE="0660", TAG+="uaccess"
+
+# evdev access to the Pilot W-CORNE only (OS-hook fallback + evdev hotkeys).
+# Scoped to this one keyboard on purpose: putting your user in the broad
+# `input` group instead would allow any app to read every input device.
+SUBSYSTEM=="input", KERNEL=="event*", ATTRS{idVendor}=="55d4", ATTRS{idProduct}=="0461", TAG+="uaccess"
+
+# Auto-launch on plug: ask the logged-in user's systemd to start the overlay
+# when the board appears.  Needs systemd/overlaycorne.service installed to
+# ~/.config/systemd/user/ (see README); harmless no-op otherwise.
+ACTION=="add", SUBSYSTEM=="hidraw", ATTRS{serial}=="*vial:f64c2b3c*", TAG+="systemd", ENV{SYSTEMD_USER_WANTS}+="overlaycorne.service"

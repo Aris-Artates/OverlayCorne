@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=OverlayCorne
+Comment=Vial Corne keyboard overlay
+Exec=overlaycorne
+Icon=input-keyboard
+Terminal=false
+Categories=Utility;

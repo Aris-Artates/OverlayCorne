@@ -1,0 +1,63 @@
+name: build-executables
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch: {}
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-22.04            # oldest glibc -> widest Linux compat
+            name: overlaycorne
+            bin: dist/overlaycorne
+            asset: overlaycorne-linux-x86_64
+            data_sep: ":"
+          - os: windows-latest
+            name: OverlayCorne
+            bin: dist/OverlayCorne.exe
+            asset: OverlayCorne-windows-x86_64.exe
+            data_sep: ";"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"        # guaranteed PyInstaller + wheel support
+      - name: Install Tk (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y python3-tk
+      - name: Fail fast if tkinter is missing
+        run: python -c "import tkinter"
+      - run: pip install pyinstaller -r requirements.txt
+      - name: Build
+        run: >
+          pyinstaller --onefile --noconsole --name ${{ matrix.name }}
+          --add-data "corne_dvorak_programmer.vil${{ matrix.data_sep }}."
+          ${{ runner.os == 'Linux' && '--hidden-import evdev' || '' }}
+          overlay_corne.py
+      - name: Rename to asset name
+        shell: bash
+        run: cp "${{ matrix.bin }}" "${{ matrix.asset }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: ${{ matrix.asset }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            overlaycorne-linux-x86_64
+            OverlayCorne-windows-x86_64.exe

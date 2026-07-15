@@ -1,2 +1,5 @@
 __pycache__/
 overlay_config.json
+build/
+dist/
+*.spec

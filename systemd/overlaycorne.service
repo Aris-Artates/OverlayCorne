@@ -1,0 +1,23 @@
+# User service for OverlayCorne.  Install:
+#   install -Dm644 systemd/overlaycorne.service ~/.config/systemd/user/overlaycorne.service
+#   systemctl --user daemon-reload
+# Started automatically by udev when the keyboard is plugged in (see
+# udev/70-vial.rules), or at login via: systemctl --user enable overlaycorne
+#
+# ExecStart assumes the packaged binary at ~/.local/bin/overlaycorne; for a
+# source checkout change it to e.g.:
+#   ExecStart=/usr/bin/python3 /home/YOU/aCode/OverlayCorne/overlay_corne.py
+
+[Unit]
+Description=OverlayCorne keyboard overlay
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/overlaycorne
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

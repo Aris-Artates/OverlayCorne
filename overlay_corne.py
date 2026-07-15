@@ -2,6 +2,8 @@
 # -*- coding: utf-8 -*-
 """OverlayCorne — transparent, always-on-top keyboard overlay for a Vial Corne.
 
+Runs on Windows and Linux (X11/XWayland; developed against Fedora + GNOME).
+
 Renders the keymap from a Vial .vil export and lights up the physical keys you
 are pressing, switching the displayed legends to whatever layer is currently
 held on the board.
@@ -9,15 +11,21 @@ held on the board.
 Input sources
   HID mode (primary)   : polls the keyboard's switch matrix over Vial/VIA raw
                          HID.  Exact physical key state + true layer holds.
-  OS hook mode (backup): a low-level keyboard hook maps the keycodes Windows
-                         receives back to physical positions (approximate).
-                         Used automatically when the board is unreachable or
-                         Vial-locked.
+  OS hook mode (backup): maps the keycodes the OS receives back to physical
+                         positions (approximate).  Windows: low-level keyboard
+                         hook.  Linux: evdev (needs read access to
+                         /dev/input/event*, see README).  Used automatically
+                         when the board is unreachable or Vial-locked.
 
 Hotkeys (global)
   Ctrl+Alt+K         lock / unlock the overlay position (locked = click-through)
   Ctrl+Alt+U         start the Vial unlock handshake (only if the board is locked)
   Ctrl+Alt+Shift+K   quit the overlay
+  On Linux the hotkeys need evdev access; without it use the control verbs
+  below (bind them to GNOME custom shortcuts for the same experience):
+    overlay_corne.py --toggle-lock | --kb-unlock | --stop
+  Last-resort rescue for a locked (click-through) overlay:
+    pkill -USR1 -f overlay_corne
 
 Mouse (only while unlocked)
   Left-drag          move the overlay
@@ -28,11 +36,12 @@ from __future__ import annotations
 
 import argparse
 import ctypes
-import ctypes.wintypes as wt
 import json
 import os
 import queue
 import re
+import selectors
+import signal
 import sys
 import threading
 import time
@@ -45,16 +54,51 @@ try:
 except ImportError:
     hid = None
 
+IS_WINDOWS = sys.platform.startswith("win")
+
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_VIL = os.path.join(APP_DIR, "corne_dvorak_programmer.vil")
-CONFIG_PATH = os.path.join(APP_DIR, "overlay_config.json")
+
+
+def resource_path(name: str) -> str:
+    """Bundled read-only data.  Search order: next to the executable (user
+    override), inside the PyInstaller bundle, next to this script."""
+    cands = []
+    if getattr(sys, "frozen", False):
+        cands.append(os.path.join(os.path.dirname(sys.executable), name))
+        meipass = getattr(sys, "_MEIPASS", "")
+        if meipass:
+            cands.append(os.path.join(meipass, name))
+    cands.append(os.path.join(APP_DIR, name))
+    return next((c for c in cands if os.path.exists(c)), cands[-1])
+
+
+def config_file_path() -> str:
+    if IS_WINDOWS:
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or \
+            os.path.expanduser("~/.config")
+    return os.path.join(base, "OverlayCorne", "overlay_config.json")
+
+
+def pidfile_path() -> str:
+    base = os.environ.get("XDG_RUNTIME_DIR")
+    if base:
+        return os.path.join(base, "overlaycorne.pid")
+    return f"/tmp/overlaycorne-{os.getuid()}.pid"
+
+
+DEFAULT_VIL = resource_path("corne_dvorak_programmer.vil")
+CONFIG_PATH = config_file_path()
+LEGACY_CONFIG_PATH = os.path.join(APP_DIR, "overlay_config.json")
 
 RAW_USAGE_PAGE = 0xFF60
 RAW_USAGE = 0x61
 MSG_LEN = 32
 
 # ---------------------------------------------------------------- colors ----
-TRANSPARENT = "#010203"        # color-keyed away -> fully see-through
+TRANSPARENT = "#010203"        # color-keyed away -> fully see-through (Windows)
+LINUX_BG = "#0b0f16"           # opaque backdrop under whole-window alpha (Linux)
 PANEL = "#0f1620"
 KEY_BG = "#16202e"
 KEY_BG_LAYER = "#1c1420"
@@ -252,29 +296,44 @@ def build_outmaps(km: Keymap):
     return outmap, ctrlmap
 
 
-# ------------------------------------------------- windows VK fallback ------
-VK2KC = {}
-for _i in range(26):
-    VK2KC[0x41 + _i] = "KC_" + chr(65 + _i)
-for _i in range(10):
-    VK2KC[0x30 + _i] = f"KC_{_i}"
-for _i in range(12):
-    VK2KC[0x70 + _i] = f"KC_F{_i + 1}"
-for _i in range(10):
-    VK2KC[0x60 + _i] = f"KC_P{_i}"
-VK2KC.update({
-    0x09: "KC_TAB", 0x1B: "KC_ESC", 0x0D: "KC_ENT", 0x08: "KC_BSPC",
-    0x2E: "KC_DEL", 0x20: "KC_SPC", 0x2D: "KC_INS",
-    0x25: "KC_LEFT", 0x26: "KC_UP", 0x27: "KC_RGHT", 0x28: "KC_DOWN",
-    0x24: "KC_HOME", 0x23: "KC_END", 0x21: "KC_PGUP", 0x22: "KC_PGDN",
-    0xDE: "KC_QUOTE", 0xBC: "KC_COMMA", 0xBE: "KC_DOT", 0xBF: "KC_SLASH",
-    0xBA: "KC_SCOLON", 0xBD: "KC_MINS", 0xBB: "KC_EQL", 0xDB: "KC_LBRC",
-    0xDD: "KC_RBRC", 0xDC: "KC_BSLS", 0xC0: "KC_GRV",
-    0xAD: "KC_MUTE", 0xAE: "KC_VOLD", 0xAF: "KC_VOLU",
-    0xB0: "KC_MNXT", 0xB1: "KC_MPRV", 0xB3: "KC_MPLY",
-    0x6F: "KC_PSLS", 0x6A: "KC_PAST", 0x6B: "KC_PPLS", 0x6D: "KC_PMNS",
-    0x6E: "KC_PDOT",
-})
+# ---------------------------------------------------- physical layout -------
+# Where each switch-matrix (row, col) sits visually, in key-size units.
+# W-Corne: per half a column-staggered 3x6 grid, two inner-edge keys and
+# three thumbs.  Tweak these tables if your build differs; any matrix
+# position not listed here falls back to a plain (col, row) grid.
+COL_STAGGER = (0.30, 0.30, 0.10, 0.00, 0.10, 0.20)     # outer -> inner column
+THUMB_ARC = (0.00, 0.12, 0.26)                         # outer -> inner thumb
+THUMB_Y = 3.55                                         # thumb-row baseline
+INNER_X_L = 6.15                                       # left inner-edge column
+INNER_X_R = 7.60                                       # right inner-edge column
+RIGHT_X0 = 8.75                                        # right grid origin
+
+
+def build_physical_layout() -> dict:
+    pos = {}
+    for r in range(3):                                 # left grid: cols 0-5
+        for c in range(6):
+            pos[(r, c)] = (float(c), r + COL_STAGGER[c])
+    pos[(3, 0)] = (INNER_X_L, 0.55)                    # left inner edge (top)
+    pos[(3, 1)] = (INNER_X_L, 1.55)                    # left inner edge (low)
+    pos[(0, 6)] = (INNER_X_R, 0.55)                    # right inner edge (top)
+    pos[(1, 6)] = (INNER_X_R, 1.55)                    # right inner edge (low)
+    for r in range(3):                                 # right grid: cols 7-11
+        for c in range(7, 12):
+            p = c - 7                                  # 0 = innermost column
+            pos[(r, c)] = (RIGHT_X0 + p, r + COL_STAGGER[5 - p])
+    for i, rc in enumerate(((3, 9), (3, 10), (3, 11))):    # right outer column
+        pos[rc] = (RIGHT_X0 + 5, i + COL_STAGGER[0])
+    width = RIGHT_X0 + 6
+    for i, rc in enumerate(((3, 3), (3, 4), (3, 5))):      # left thumbs
+        pos[rc] = (3.30 + i * 1.08, THUMB_Y + THUMB_ARC[i])
+    for i, rc in enumerate(((3, 6), (3, 7), (3, 8))):      # right thumbs
+        pos[rc] = (width - 1 - (5.46 - i * 1.08), THUMB_Y + THUMB_ARC[2 - i])
+    return pos
+
+
+# -------------------------------------------------- OS hook shared bits -----
+# Shifted-symbol inference for the hook fallback (keymap logic, not platform).
 SHIFT_OF = {
     "KC_GRV": "KC_TILD", "KC_1": "KC_EXLM", "KC_2": "KC_AT",
     "KC_3": "KC_HASH", "KC_4": "KC_DLR", "KC_5": "KC_PERC",
@@ -284,12 +343,9 @@ SHIFT_OF = {
     "KC_BSLS": "KC_PIPE", "KC_SCOLON": "KC_COLN", "KC_QUOTE": "KC_DQUO",
     "KC_COMMA": "KC_LT", "KC_DOT": "KC_GT", "KC_SLASH": "KC_QUES",
 }
-VK_MOD = {
-    0x10: "Sft", 0xA0: "Sft", 0xA1: "Sft",
-    0x11: "Ctl", 0xA2: "Ctl", 0xA3: "Ctl",
-    0x12: "Alt", 0xA4: "Alt", 0xA5: "Alt",
-    0x5B: "Win", 0x5C: "Win",
-}
+
+# Global-hotkey ids, shared by every input backend and the signal handlers.
+HK_LOCK, HK_QUIT, HK_UNLOCK = 1, 2, 3
 
 # ------------------------------------------------------------ vial hid ------
 class VialDevice:
@@ -436,119 +492,446 @@ class HidPoller(threading.Thread):
         return False
 
 
-# ------------------------------------------------------- low level hook -----
-user32 = ctypes.windll.user32
-kernel32 = ctypes.windll.kernel32
-LRESULT = ctypes.c_ssize_t
-HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wt.WPARAM, wt.LPARAM)
+# ======================================================= platform layer =====
+# Everything OS-specific lives behind BACKEND (one instance of WinBackend or
+# LinuxBackend).  Input listeners post platform-neutral messages:
+#   ("oskey", "KC_*", is_down)   emitted key, already translated to KC names
+#   ("osmod", "Sft|Ctl|Alt|Win", is_down)
+#   ("hotkey", HK_*)
 
-user32.SetWindowsHookExW.restype = wt.HHOOK
-user32.SetWindowsHookExW.argtypes = (ctypes.c_int, HOOKPROC, wt.HINSTANCE,
-                                     wt.DWORD)
-user32.CallNextHookEx.restype = LRESULT
-user32.CallNextHookEx.argtypes = (wt.HHOOK, ctypes.c_int, wt.WPARAM,
-                                  wt.LPARAM)
+if IS_WINDOWS:
+    import ctypes.wintypes as wt
 
-WM_KEYDOWN, WM_KEYUP = 0x0100, 0x0101
-WM_SYSKEYDOWN, WM_SYSKEYUP = 0x0104, 0x0105
-WM_HOTKEY, WM_QUIT = 0x0312, 0x0012
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    LRESULT = ctypes.c_ssize_t
+    HOOKPROC = ctypes.WINFUNCTYPE(LRESULT, ctypes.c_int, wt.WPARAM, wt.LPARAM)
 
+    user32.SetWindowsHookExW.restype = wt.HHOOK
+    user32.SetWindowsHookExW.argtypes = (ctypes.c_int, HOOKPROC, wt.HINSTANCE,
+                                         wt.DWORD)
+    user32.CallNextHookEx.restype = LRESULT
+    user32.CallNextHookEx.argtypes = (wt.HHOOK, ctypes.c_int, wt.WPARAM,
+                                      wt.LPARAM)
 
-class KBDLLHOOKSTRUCT(ctypes.Structure):
-    _fields_ = [("vkCode", wt.DWORD), ("scanCode", wt.DWORD),
-                ("flags", wt.DWORD), ("time", wt.DWORD),
-                ("dwExtraInfo", ctypes.c_size_t)]
+    WM_KEYDOWN, WM_KEYUP = 0x0100, 0x0101
+    WM_SYSKEYDOWN, WM_SYSKEYUP = 0x0104, 0x0105
+    WM_HOTKEY, WM_QUIT = 0x0312, 0x0012
 
+    VK2KC = {}
+    for _i in range(26):
+        VK2KC[0x41 + _i] = "KC_" + chr(65 + _i)
+    for _i in range(10):
+        VK2KC[0x30 + _i] = f"KC_{_i}"
+    for _i in range(12):
+        VK2KC[0x70 + _i] = f"KC_F{_i + 1}"
+    for _i in range(10):
+        VK2KC[0x60 + _i] = f"KC_P{_i}"
+    VK2KC.update({
+        0x09: "KC_TAB", 0x1B: "KC_ESC", 0x0D: "KC_ENT", 0x08: "KC_BSPC",
+        0x2E: "KC_DEL", 0x20: "KC_SPC", 0x2D: "KC_INS",
+        0x25: "KC_LEFT", 0x26: "KC_UP", 0x27: "KC_RGHT", 0x28: "KC_DOWN",
+        0x24: "KC_HOME", 0x23: "KC_END", 0x21: "KC_PGUP", 0x22: "KC_PGDN",
+        0xDE: "KC_QUOTE", 0xBC: "KC_COMMA", 0xBE: "KC_DOT", 0xBF: "KC_SLASH",
+        0xBA: "KC_SCOLON", 0xBD: "KC_MINS", 0xBB: "KC_EQL", 0xDB: "KC_LBRC",
+        0xDD: "KC_RBRC", 0xDC: "KC_BSLS", 0xC0: "KC_GRV",
+        0xAD: "KC_MUTE", 0xAE: "KC_VOLD", 0xAF: "KC_VOLU",
+        0xB0: "KC_MNXT", 0xB1: "KC_MPRV", 0xB3: "KC_MPLY",
+        0x6F: "KC_PSLS", 0x6A: "KC_PAST", 0x6B: "KC_PPLS", 0x6D: "KC_PMNS",
+        0x6E: "KC_PDOT",
+    })
+    VK_MOD = {
+        0x10: "Sft", 0xA0: "Sft", 0xA1: "Sft",
+        0x11: "Ctl", 0xA2: "Ctl", 0xA3: "Ctl",
+        0x12: "Alt", 0xA4: "Alt", 0xA5: "Alt",
+        0x5B: "Win", 0x5C: "Win",
+    }
 
-class HookThread(threading.Thread):
-    """WH_KEYBOARD_LL listener; feeds ('vk', code, is_down) into the queue."""
+    class KBDLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [("vkCode", wt.DWORD), ("scanCode", wt.DWORD),
+                    ("flags", wt.DWORD), ("time", wt.DWORD),
+                    ("dwExtraInfo", ctypes.c_size_t)]
 
-    def __init__(self, out: queue.Queue, stop: threading.Event):
-        super().__init__(daemon=True, name="kbd-hook")
-        self.out, self.stop = out, stop
+    class WinHookThread(threading.Thread):
+        """WH_KEYBOARD_LL listener; posts ('oskey'/'osmod', …) into the queue."""
 
-    def run(self):
-        @HOOKPROC
-        def proc(nCode, wParam, lParam):
-            if nCode == 0:
-                ks = ctypes.cast(lParam,
-                                 ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-                down = wParam in (WM_KEYDOWN, WM_SYSKEYDOWN)
-                up = wParam in (WM_KEYUP, WM_SYSKEYUP)
-                if down or up:
-                    self.out.put(("vk", ks.vkCode, down))
-            return user32.CallNextHookEx(None, nCode, wParam, lParam)
+        def __init__(self, out: queue.Queue, stop: threading.Event):
+            super().__init__(daemon=True, name="kbd-hook")
+            self.out, self.stop = out, stop
 
-        self._proc = proc                      # keep alive (GC guard)
-        hook = user32.SetWindowsHookExW(13, proc, None, 0)
-        if not hook:
-            self.out.put(("log", "keyboard hook failed"))
-            return
-        msg = wt.MSG()
-        while not self.stop.is_set():
-            r = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-            if r == 0 or r == -1:
-                break
-        user32.UnhookWindowsHookEx(hook)
+        def run(self):
+            @HOOKPROC
+            def proc(nCode, wParam, lParam):
+                if nCode == 0:
+                    ks = ctypes.cast(lParam,
+                                     ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+                    down = wParam in (WM_KEYDOWN, WM_SYSKEYDOWN)
+                    up = wParam in (WM_KEYUP, WM_SYSKEYUP)
+                    if down or up:
+                        vk = ks.vkCode
+                        if vk in VK_MOD:
+                            self.out.put(("osmod", VK_MOD[vk], down))
+                        else:
+                            kc = VK2KC.get(vk)
+                            if kc:
+                                self.out.put(("oskey", kc, down))
+                return user32.CallNextHookEx(None, nCode, wParam, lParam)
 
+            self._proc = proc                      # keep alive (GC guard)
+            hook = user32.SetWindowsHookExW(13, proc, None, 0)
+            if not hook:
+                self.out.put(("log", "keyboard hook failed"))
+                return
+            msg = wt.MSG()
+            while not self.stop.is_set():
+                r = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if r == 0 or r == -1:
+                    break
+            user32.UnhookWindowsHookEx(hook)
 
-class HotkeyThread(threading.Thread):
-    """Global hotkeys: Ctrl+Alt+K lock, Ctrl+Alt+Shift+K quit, Ctrl+Alt+U unlock."""
+    class WinHotkeyThread(threading.Thread):
+        """Global hotkeys: Ctrl+Alt+K lock, Ctrl+Alt+Shift+K quit, Ctrl+Alt+U unlock."""
 
-    HK_LOCK, HK_QUIT, HK_UNLOCK = 1, 2, 3
+        def __init__(self, out: queue.Queue, stop: threading.Event):
+            super().__init__(daemon=True, name="hotkeys")
+            self.out, self.stop = out, stop
 
-    def __init__(self, out: queue.Queue, stop: threading.Event):
-        super().__init__(daemon=True, name="hotkeys")
-        self.out, self.stop = out, stop
+        def run(self):
+            MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_NOREPEAT = 1, 2, 4, 0x4000
+            regs = [
+                (HK_LOCK, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, ord("K")),
+                (HK_QUIT, MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT,
+                 ord("K")),
+                (HK_UNLOCK, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, ord("U")),
+            ]
+            for hk_id, mods, vk in regs:
+                if not user32.RegisterHotKey(None, hk_id, mods, vk):
+                    self.out.put(("log", f"hotkey id {hk_id} not registered"))
+            msg = wt.MSG()
+            while not self.stop.is_set():
+                r = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if r == 0 or r == -1:
+                    break
+                if msg.message == WM_HOTKEY:
+                    self.out.put(("hotkey", msg.wParam))
+            for hk_id, _, _ in regs:
+                user32.UnregisterHotKey(None, hk_id)
 
-    def run(self):
-        MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_NOREPEAT = 1, 2, 4, 0x4000
-        regs = [
-            (self.HK_LOCK, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, ord("K")),
-            (self.HK_QUIT, MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_NOREPEAT,
-             ord("K")),
-            (self.HK_UNLOCK, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, ord("U")),
-        ]
-        for hk_id, mods, vk in regs:
-            if not user32.RegisterHotKey(None, hk_id, mods, vk):
-                self.out.put(("log", f"hotkey id {hk_id} not registered"))
-        msg = wt.MSG()
-        while not self.stop.is_set():
-            r = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-            if r == 0 or r == -1:
-                break
-            if msg.message == WM_HOTKEY:
-                self.out.put(("hotkey", msg.wParam))
-        for hk_id, _, _ in regs:
-            user32.UnregisterHotKey(None, hk_id)
+    GWL_EXSTYLE = -20
+    WS_EX_LAYERED = 0x00080000
+    WS_EX_TRANSPARENT = 0x00000020
+    WS_EX_TOOLWINDOW = 0x00000080
+    WS_EX_NOACTIVATE = 0x08000000
 
+    try:
+        _GetWL = user32.GetWindowLongPtrW
+        _SetWL = user32.SetWindowLongPtrW
+    except AttributeError:
+        _GetWL = user32.GetWindowLongW
+        _SetWL = user32.SetWindowLongW
+    _GetWL.restype = ctypes.c_ssize_t
+    _GetWL.argtypes = (wt.HWND, ctypes.c_int)
+    _SetWL.restype = ctypes.c_ssize_t
+    _SetWL.argtypes = (wt.HWND, ctypes.c_int, ctypes.c_ssize_t)
 
-# ------------------------------------------------------- window helpers -----
-GWL_EXSTYLE = -20
-WS_EX_LAYERED = 0x00080000
-WS_EX_TRANSPARENT = 0x00000020
-WS_EX_TOOLWINDOW = 0x00000080
-WS_EX_NOACTIVATE = 0x08000000
+    class WinBackend:
+        def set_dpi_awareness(self):
+            try:
+                ctypes.windll.shcore.SetProcessDpiAwareness(2)
+            except Exception:
+                try:
+                    user32.SetProcessDPIAware()
+                except Exception:
+                    pass
 
-try:
-    _GetWL = user32.GetWindowLongPtrW
-    _SetWL = user32.SetWindowLongPtrW
-except AttributeError:
-    _GetWL = user32.GetWindowLongW
-    _SetWL = user32.SetWindowLongW
-_GetWL.restype = ctypes.c_ssize_t
-_GetWL.argtypes = (wt.HWND, ctypes.c_int)
-_SetWL.restype = ctypes.c_ssize_t
-_SetWL.argtypes = (wt.HWND, ctypes.c_int, ctypes.c_ssize_t)
+        def prepare_window(self, root) -> str:
+            root.attributes("-transparentcolor", TRANSPARENT)
+            try:
+                root.attributes("-alpha", 0.97)
+            except tk.TclError:
+                pass
+            return TRANSPARENT
 
+        def _hwnd(self, root):
+            return user32.GetAncestor(root.winfo_id(), 2)
 
-def work_area():
-    class RECT(ctypes.Structure):
-        _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
-                    ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
-    r = RECT()
-    user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(r), 0)
-    return r.left, r.top, r.right, r.bottom
+        def apply_click_through(self, root, locked: bool):
+            hwnd = self._hwnd(root)
+            style = _GetWL(hwnd, GWL_EXSTYLE)
+            style |= WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
+            if locked:
+                style |= WS_EX_TRANSPARENT
+            else:
+                style &= ~WS_EX_TRANSPARENT
+            _SetWL(hwnd, GWL_EXSTYLE, style)
+            user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x1 | 0x2 | 0x10 | 0x20)
+
+        def assert_topmost(self, root):
+            user32.SetWindowPos(self._hwnd(root), -1, 0, 0, 0, 0,
+                                0x1 | 0x2 | 0x10)
+
+        def work_area(self, root):
+            class RECT(ctypes.Structure):
+                _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                            ("right", ctypes.c_long),
+                            ("bottom", ctypes.c_long)]
+            r = RECT()
+            user32.SystemParametersInfoW(0x0030, 0, ctypes.byref(r), 0)
+            return r.left, r.top, r.right, r.bottom
+
+        def font_family(self, root) -> str:
+            return "Segoe UI"
+
+        def start_input_threads(self, q: queue.Queue, stop: threading.Event):
+            WinHookThread(q, stop).start()
+            WinHotkeyThread(q, stop).start()
+
+    BACKEND = WinBackend()
+
+else:
+    # X11/XWayland + evdev.  Global hotkey grabs are impossible under
+    # Wayland, so hotkeys come from the evdev listener (when /dev/input is
+    # readable) and from Unix signals (always; see main()).
+
+    def _build_evmaps(ecodes):
+        """evdev keycode -> KC_* / modifier tag (Linux twin of VK2KC/VK_MOD).
+        evdev codes map 1:1 to the USB HID usages the board emits; the XKB
+        layout is not involved, so this is as exact as the Windows VK path."""
+        ev2kc = {}
+        for ch in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            ev2kc[getattr(ecodes, f"KEY_{ch}")] = f"KC_{ch}"
+        for d in "0123456789":
+            ev2kc[getattr(ecodes, f"KEY_{d}")] = f"KC_{d}"
+        for i in range(1, 13):
+            ev2kc[getattr(ecodes, f"KEY_F{i}")] = f"KC_F{i}"
+        for d in "0123456789":
+            ev2kc[getattr(ecodes, f"KEY_KP{d}")] = f"KC_P{d}"
+        ev2kc.update({
+            ecodes.KEY_TAB: "KC_TAB", ecodes.KEY_ESC: "KC_ESC",
+            ecodes.KEY_ENTER: "KC_ENT", ecodes.KEY_BACKSPACE: "KC_BSPC",
+            ecodes.KEY_DELETE: "KC_DEL", ecodes.KEY_SPACE: "KC_SPC",
+            ecodes.KEY_INSERT: "KC_INS", ecodes.KEY_CAPSLOCK: "KC_CAPS",
+            ecodes.KEY_LEFT: "KC_LEFT", ecodes.KEY_UP: "KC_UP",
+            ecodes.KEY_RIGHT: "KC_RGHT", ecodes.KEY_DOWN: "KC_DOWN",
+            ecodes.KEY_HOME: "KC_HOME", ecodes.KEY_END: "KC_END",
+            ecodes.KEY_PAGEUP: "KC_PGUP", ecodes.KEY_PAGEDOWN: "KC_PGDN",
+            ecodes.KEY_APOSTROPHE: "KC_QUOTE", ecodes.KEY_COMMA: "KC_COMMA",
+            ecodes.KEY_DOT: "KC_DOT", ecodes.KEY_SLASH: "KC_SLASH",
+            ecodes.KEY_SEMICOLON: "KC_SCOLON", ecodes.KEY_MINUS: "KC_MINS",
+            ecodes.KEY_EQUAL: "KC_EQL", ecodes.KEY_LEFTBRACE: "KC_LBRC",
+            ecodes.KEY_RIGHTBRACE: "KC_RBRC", ecodes.KEY_BACKSLASH: "KC_BSLS",
+            ecodes.KEY_GRAVE: "KC_GRV", ecodes.KEY_SYSRQ: "KC_PSCR",
+            ecodes.KEY_MUTE: "KC_MUTE", ecodes.KEY_VOLUMEDOWN: "KC_VOLD",
+            ecodes.KEY_VOLUMEUP: "KC_VOLU",
+            ecodes.KEY_NEXTSONG: "KC_MNXT",
+            ecodes.KEY_PREVIOUSSONG: "KC_MPRV",
+            ecodes.KEY_PLAYPAUSE: "KC_MPLY",
+            ecodes.KEY_KPSLASH: "KC_PSLS", ecodes.KEY_KPASTERISK: "KC_PAST",
+            ecodes.KEY_KPPLUS: "KC_PPLS", ecodes.KEY_KPMINUS: "KC_PMNS",
+            ecodes.KEY_KPDOT: "KC_PDOT", ecodes.KEY_KPENTER: "KC_PENT",
+        })
+        evmod = {
+            ecodes.KEY_LEFTSHIFT: "Sft", ecodes.KEY_RIGHTSHIFT: "Sft",
+            ecodes.KEY_LEFTCTRL: "Ctl", ecodes.KEY_RIGHTCTRL: "Ctl",
+            ecodes.KEY_LEFTALT: "Alt", ecodes.KEY_RIGHTALT: "Alt",
+            ecodes.KEY_LEFTMETA: "Win", ecodes.KEY_RIGHTMETA: "Win",
+        }
+        return ev2kc, evmod
+
+    class EvdevListenerThread(threading.Thread):
+        """Reads every readable keyboard under /dev/input; posts
+        ('oskey'/'osmod', …) and detects the global hotkey combos.  Unlike
+        RegisterHotKey on Windows, the keystroke is NOT swallowed — the
+        focused app still receives Ctrl+Alt+K."""
+
+        RESCAN_S = 3.0
+
+        def __init__(self, out: queue.Queue, stop: threading.Event):
+            super().__init__(daemon=True, name="evdev-listener")
+            self.out, self.stop = out, stop
+            self.mods: set = set()
+
+        def run(self):
+            import evdev
+            from evdev import ecodes
+            ev2kc, evmod = _build_evmaps(ecodes)
+            self._ecodes, self._ev2kc, self._evmod = ecodes, ev2kc, evmod
+            sel = selectors.DefaultSelector()
+            opened: dict = {}                      # path -> InputDevice
+            warned = False
+            last_scan = -self.RESCAN_S
+            while not self.stop.is_set():
+                now = time.monotonic()
+                if now - last_scan >= self.RESCAN_S:
+                    last_scan = now
+                    warned = self._rescan(evdev, sel, opened, warned)
+                for skey, _ in sel.select(timeout=0.5):
+                    dev = skey.fileobj
+                    try:
+                        for ev in dev.read():
+                            if ev.type == ecodes.EV_KEY and ev.value in (0, 1):
+                                self._on_key(ev.code, ev.value == 1)
+                    except OSError:
+                        self._drop(sel, opened, dev)
+            for dev in list(opened.values()):
+                self._drop(sel, opened, dev)
+
+        def _rescan(self, evdev, sel, opened, warned) -> bool:
+            ecodes = self._ecodes
+            paths = set(evdev.list_devices())
+            for dev in [d for d in opened.values() if d.path not in paths]:
+                self._drop(sel, opened, dev)
+            for path in paths - set(opened):
+                try:
+                    dev = evdev.InputDevice(path)
+                    caps = dev.capabilities().get(ecodes.EV_KEY, [])
+                    if ecodes.KEY_A not in caps:       # not a keyboard
+                        dev.close()
+                        continue
+                    opened[path] = dev
+                    sel.register(dev, selectors.EVENT_READ)
+                except (OSError, PermissionError):
+                    continue
+            if not opened and not warned:
+                warned = True
+                self.out.put(("log",
+                              "evdev: no readable keyboards -> OS-hook "
+                              "fallback & hotkeys disabled (see README; "
+                              "--toggle-lock etc. still work)"))
+            return warned
+
+        def _drop(self, sel, opened, dev):
+            try:
+                sel.unregister(dev)
+            except (KeyError, ValueError):
+                pass
+            opened.pop(getattr(dev, "path", None), None)
+            try:
+                dev.close()
+            except Exception:
+                pass
+
+        def _on_key(self, code: int, down: bool):
+            ecodes = self._ecodes
+            tag = self._evmod.get(code)
+            if tag:
+                (self.mods.add if down else self.mods.discard)(tag)
+                self.out.put(("osmod", tag, down))
+                return
+            if down and {"Ctl", "Alt"} <= self.mods:
+                if code == ecodes.KEY_U:
+                    self.out.put(("hotkey", HK_UNLOCK))
+                    return
+                if code == ecodes.KEY_K:
+                    self.out.put(("hotkey",
+                                  HK_QUIT if "Sft" in self.mods else HK_LOCK))
+                    return
+            kc = self._ev2kc.get(code)
+            if kc:
+                self.out.put(("oskey", kc, down))
+
+    class _X11:
+        """Minimal ctypes bindings for the X Shape input-region trick
+        (click-through).  Works under XWayland: Mutter honors X11 input
+        shapes when routing pointer events."""
+
+        ShapeInput, ShapeSet = 2, 0
+
+        def __init__(self):
+            self.x11 = ctypes.CDLL("libX11.so.6")
+            self.xext = ctypes.CDLL("libXext.so.6")
+            self.x11.XOpenDisplay.restype = ctypes.c_void_p
+            self.x11.XOpenDisplay.argtypes = (ctypes.c_char_p,)
+            self.x11.XFlush.argtypes = (ctypes.c_void_p,)
+            self.xext.XShapeCombineRectangles.argtypes = (
+                ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int)
+            self.xext.XShapeCombineMask.argtypes = (
+                ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_ulong, ctypes.c_int)
+            self.dpy = self.x11.XOpenDisplay(None)
+            if not self.dpy:
+                raise OSError("XOpenDisplay failed (no X11/XWayland?)")
+
+        def set_click_through(self, win: int, on: bool):
+            if on:       # empty input region -> clicks fall through
+                self.xext.XShapeCombineRectangles(
+                    self.dpy, win, self.ShapeInput, 0, 0, None, 0,
+                    self.ShapeSet, 0)
+            else:        # None mask resets the input region to the default
+                self.xext.XShapeCombineMask(
+                    self.dpy, win, self.ShapeInput, 0, 0, 0, self.ShapeSet)
+            self.x11.XFlush(self.dpy)
+
+    class LinuxBackend:
+        def __init__(self):
+            self._x: Optional[_X11] = None
+            self._x_failed = False
+
+        def _shape(self) -> Optional[_X11]:
+            if self._x is None and not self._x_failed:
+                try:
+                    self._x = _X11()
+                except OSError as e:
+                    self._x_failed = True
+                    print(f"click-through unavailable: {e}")
+            return self._x
+
+        def set_dpi_awareness(self):
+            pass
+
+        def prepare_window(self, root) -> str:
+            # No color-key transparency on Linux Tk; translucent panel
+            # via whole-window alpha over an opaque backdrop instead.
+            try:
+                root.attributes("-alpha", 0.94)
+            except tk.TclError:
+                pass
+            return LINUX_BG
+
+        def apply_click_through(self, root, locked: bool):
+            x = self._shape()
+            if x is None:
+                return
+            # shape the outermost X window (wm_frame covers the wrapper
+            # window Tk creates for managed toplevels; == winfo_id for
+            # override-redirect ones)
+            try:
+                win = int(root.wm_frame(), 16) or root.winfo_id()
+            except (ValueError, tk.TclError):
+                win = root.winfo_id()
+            x.set_click_through(win, locked)
+
+        def assert_topmost(self, root):
+            root.lift()
+
+        def work_area(self, root):
+            # GNOME's top bar overlaps at worst --margin pixels; not worth
+            # a _NET_WORKAREA round-trip.
+            return 0, 0, root.winfo_screenwidth(), root.winfo_screenheight()
+
+        def font_family(self, root) -> str:
+            fams = set(tkfont.families(root))
+            for fam in ("Cantarell", "Adwaita Sans", "Noto Sans",
+                        "DejaVu Sans"):
+                if fam in fams:
+                    return fam
+            return tkfont.nametofont("TkDefaultFont").actual("family")
+
+        def start_input_threads(self, q: queue.Queue, stop: threading.Event):
+            try:
+                import evdev                       # noqa: F401
+            except ImportError:
+                q.put(("log",
+                       "python-evdev not installed -> no OS-hook fallback or "
+                       "evdev hotkeys (pip install evdev  /  sudo dnf "
+                       "install python3-evdev); --toggle-lock etc. still "
+                       "work"))
+                return
+            EvdevListenerThread(q, stop).start()
+
+    BACKEND = LinuxBackend()
 
 
 # ------------------------------------------------------------- overlay ------
@@ -556,7 +939,9 @@ class OverlayApp:
     def __init__(self, km: Keymap, args):
         self.km = km
         self.args = args
-        self.q: queue.Queue = queue.Queue()
+        # SimpleQueue: put() is reentrant (C impl), so the Linux signal
+        # handlers can safely enqueue while _pump is mid-get_nowait().
+        self.q = queue.SimpleQueue()
         self.stop = threading.Event()
 
         self.outmap, self.ctrlmap = build_outmaps(km)
@@ -565,7 +950,8 @@ class OverlayApp:
         self.source = "connecting"      # hid | hook | locked | disconnected
         self.pressed_hid: frozenset = frozenset()
         self.pressed_hook: set = set()
-        self.hook_held: dict = {}       # vk -> (r, c)
+        self.hook_held: dict = {}       # emitted KC name -> (r, c)
+        self._hk_ts: dict = {}          # hotkey id -> last-fire monotonic
         self.hook_layer = 0
         self.hook_expiry = 0.0
         self.layer_hid = 0
@@ -588,17 +974,22 @@ class OverlayApp:
         self.root.title("OverlayCorne")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
-        self.root.attributes("-transparentcolor", TRANSPARENT)
-        try:
-            self.root.attributes("-alpha", 0.97)
-        except tk.TclError:
-            pass
-        self.root.configure(bg=TRANSPARENT)
+        self.bg = BACKEND.prepare_window(self.root)
+        self.root.configure(bg=self.bg)
 
-        self.canvas = tk.Canvas(self.root, bg=TRANSPARENT,
+        self.canvas = tk.Canvas(self.root, bg=self.bg,
                                 highlightthickness=0, bd=0)
         self.canvas.pack(fill="both", expand=True)
 
+        self._font_family = BACKEND.font_family(self.root)
+        table = build_physical_layout()
+        if set(km.positions) <= set(table):
+            self.phys = {rc: table[rc] for rc in km.positions}
+        else:
+            # unknown matrix wiring (different board/vil) -> render the
+            # whole thing as a plain grid rather than interleave the two
+            self.phys = {(r, c): (float(c), float(r))
+                         for (r, c) in km.positions}
         self._metrics()
         self._place_window(initial=True)
 
@@ -607,18 +998,24 @@ class OverlayApp:
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
         self.canvas.bind("<Button-3>", self._on_menu)
 
+        # On Linux the hotkeys need evdev access, so also advertise the
+        # always-available CLI verbs (the click-through rescue hatch).
+        lock_hint = "Ctrl+Alt+K" if IS_WINDOWS else "Ctrl+Alt+K / --toggle-lock"
+        unlock_hint = "Ctrl+Alt+U" if IS_WINDOWS else "Ctrl+Alt+U / --kb-unlock"
+        quit_hint = "Ctrl+Alt+Shift+K" if IS_WINDOWS else \
+            "Ctrl+Alt+Shift+K / --stop"
         self.menu = tk.Menu(self.root, tearoff=0)
-        self.menu.add_command(label="Lock position   (Ctrl+Alt+K)",
+        self.menu.add_command(label=f"Lock position   ({lock_hint})",
                               command=self.toggle_lock)
         self.menu.add_command(label="Snap bottom-right",
                               command=self._snap_bottom_right)
         self.menu.add_command(label="Scale +", command=lambda: self._rescale(+0.1))
         self.menu.add_command(label="Scale -", command=lambda: self._rescale(-0.1))
         self.menu.add_separator()
-        self.menu.add_command(label="Unlock keyboard (Vial)  (Ctrl+Alt+U)",
+        self.menu.add_command(label=f"Unlock keyboard (Vial)  ({unlock_hint})",
                               command=self._request_kb_unlock)
         self.menu.add_separator()
-        self.menu.add_command(label="Quit   (Ctrl+Alt+Shift+K)",
+        self.menu.add_command(label=f"Quit   ({quit_hint})",
                               command=self.quit)
 
         # --- threads ---
@@ -632,10 +1029,9 @@ class OverlayApp:
             if hid is None:
                 print("hidapi not installed -> OS hook mode only "
                       "(pip install hidapi)")
-        HookThread(self.q, self.stop).start()
-        HotkeyThread(self.q, self.stop).start()
+        BACKEND.start_input_threads(self.q, self.stop)
 
-        self.root.after(80, self._apply_exstyles)
+        self.root.after(80, self._apply_click_through)
         self.root.after(20, self._pump)
         self.root.after(3000, self._assert_topmost)
 
@@ -644,17 +1040,21 @@ class OverlayApp:
         s = self.scale
         self.k = int(34 * s)              # key size
         self.g = max(2, int(5 * s))       # gap
-        self.inner = int(11 * s)          # extra gap around inner column
         self.pad = int(8 * s)
         self.header_h = int(26 * s)
-        self.thumb_drop = int(6 * s)
-        self.w = self.pad * 2 + self.km.cols * self.k \
-            + (self.km.cols - 1) * self.g + 2 * self.inner
-        self.h = self.pad * 2 + self.header_h + self.km.rows * self.k \
-            + (self.km.rows - 1) * self.g + self.thumb_drop
+        u = self.k + self.g
+        self._rects = {}
+        for rc, (X, Y) in self.phys.items():
+            x = self.pad + int(X * u)
+            y = self.pad + self.header_h + int(Y * u)
+            self._rects[rc] = (x, y, x + self.k, y + self.k)
+        max_x = max((X for X, _ in self.phys.values()), default=0.0)
+        max_y = max((Y for _, Y in self.phys.values()), default=0.0)
+        self.w = self.pad * 2 + int(max_x * u) + self.k
+        self.h = self.pad * 2 + self.header_h + int(max_y * u) + self.k
 
         def f(size, bold=True):
-            return tkfont.Font(family="Segoe UI",
+            return tkfont.Font(family=self._font_family,
                                size=-max(8, int(size * s)),
                                weight="bold" if bold else "normal")
         self.f_big = f(15)
@@ -673,33 +1073,25 @@ class OverlayApp:
         return self.f_small
 
     def key_rect(self, r, c):
-        x = self.pad + c * (self.k + self.g)
-        if c >= 6:
-            x += self.inner
-        if c >= 7:
-            x += self.inner
-        y = self.pad + self.header_h + r * (self.k + self.g)
-        if r == self.km.rows - 1:
-            y += self.thumb_drop
-        return x, y, x + self.k, y + self.k
+        return self._rects[(r, c)]
 
     def _place_window(self, initial=False):
         self.canvas.config(width=self.w, height=self.h)
         if initial and self._cfg_pos:
             x, y = self._cfg_pos
-            l, t, rr, bb = work_area()
+            l, t, rr, bb = BACKEND.work_area(self.root)
             if not (l - self.w < x < rr and t - self.h < y < bb):
                 x = y = None
         else:
             x = y = None
         if x is None:
-            l, t, rr, bb = work_area()
+            l, t, rr, bb = BACKEND.work_area(self.root)
             x = rr - self.w - self.args.margin
             y = bb - self.h - self.args.margin
         self.root.geometry(f"{self.w}x{self.h}+{x}+{y}")
 
     def _snap_bottom_right(self):
-        l, t, rr, bb = work_area()
+        l, t, rr, bb = BACKEND.work_area(self.root)
         self.root.geometry(
             f"+{rr - self.w - self.args.margin}+{bb - self.h - self.args.margin}")
         self._save_config()
@@ -715,50 +1107,48 @@ class OverlayApp:
         self._save_config()
         self._dirty = True
 
-    # ---------------- win32 styles ----------------
-    def _hwnd(self):
-        return user32.GetAncestor(self.root.winfo_id(), 2)
-
-    def _apply_exstyles(self):
-        hwnd = self._hwnd()
-        style = _GetWL(hwnd, GWL_EXSTYLE)
-        style |= WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE
-        if self.locked:
-            style |= WS_EX_TRANSPARENT
-        else:
-            style &= ~WS_EX_TRANSPARENT
-        _SetWL(hwnd, GWL_EXSTYLE, style)
-        user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x1 | 0x2 | 0x10 | 0x20)
+    # ---------------- platform window state ----------------
+    def _apply_click_through(self):
+        BACKEND.apply_click_through(self.root, self.locked)
 
     def _assert_topmost(self):
         if self.stop.is_set():
             return
         try:
-            user32.SetWindowPos(self._hwnd(), -1, 0, 0, 0, 0, 0x1 | 0x2 | 0x10)
+            BACKEND.assert_topmost(self.root)
         except Exception:
             pass
         self.root.after(3000, self._assert_topmost)
 
     def toggle_lock(self):
         self.locked = not self.locked
-        self._apply_exstyles()
+        self._apply_click_through()
         self._save_config()
         self._dirty = True
 
     # ---------------- config ----------------
     def _load_config(self):
         self._cfg_pos = None
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-            self._cfg_pos = (int(cfg["x"]), int(cfg["y"]))
-            self.locked = bool(cfg.get("locked", False))
-            self.scale = float(cfg.get("scale", 1.0))
-        except Exception:
-            pass
+        paths = [CONFIG_PATH]
+        if getattr(sys, "frozen", False):      # pre-move location (exe dir)
+            paths.append(os.path.join(os.path.dirname(sys.executable),
+                                      "overlay_config.json"))
+        else:                                  # pre-move location (script dir)
+            paths.append(LEGACY_CONFIG_PATH)
+        for path in paths:
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                self._cfg_pos = (int(cfg["x"]), int(cfg["y"]))
+                self.locked = bool(cfg.get("locked", False))
+                self.scale = float(cfg.get("scale", 1.0))
+                return
+            except Exception:
+                continue
 
     def _save_config(self):
         try:
+            os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
             with open(CONFIG_PATH, "w", encoding="utf-8") as f:
                 json.dump({"x": self.root.winfo_x(), "y": self.root.winfo_y(),
                            "locked": self.locked, "scale": self.scale}, f)
@@ -818,8 +1208,10 @@ class OverlayApp:
         kind = msg[0]
         if kind == "matrix":
             self._on_matrix(msg[1])
-        elif kind == "vk":
-            self._on_vk(msg[1], msg[2])
+        elif kind == "oskey":
+            self._on_oskey(msg[1], msg[2])
+        elif kind == "osmod":
+            self._on_osmod(msg[1], msg[2])
         elif kind == "mode":
             mode = msg[1]
             self.source = "hid" if mode == "hid" else \
@@ -832,14 +1224,20 @@ class OverlayApp:
             self.kb_lock_info = msg[1]
             self._dirty = True
         elif kind == "hotkey":
-            if msg[1] == HotkeyThread.HK_LOCK:
+            # debounce: evdev combo + a GNOME custom shortcut may both fire
+            hk = msg[1]
+            now = time.monotonic()
+            if now - self._hk_ts.get(hk, -1.0) < 0.3:
+                return
+            self._hk_ts[hk] = now
+            if hk == HK_LOCK:
                 self.toggle_lock()
-            elif msg[1] == HotkeyThread.HK_QUIT:
+            elif hk == HK_QUIT:
                 self.quit()
-            elif msg[1] == HotkeyThread.HK_UNLOCK:
+            elif hk == HK_UNLOCK:
                 self._request_kb_unlock()
         elif kind == "log":
-            print(msg[1])
+            print(msg[1], flush=True)
 
     # ---------------- HID state ----------------
     def _on_matrix(self, m: frozenset):
@@ -871,23 +1269,20 @@ class OverlayApp:
         self._dirty = True
 
     # ---------------- hook state ----------------
-    def _on_vk(self, vk: int, down: bool):
-        if vk in VK_MOD:
-            (self.mods.add if down else self.mods.discard)(VK_MOD[vk])
-            self._dirty = True
-            return
+    def _on_osmod(self, tag: str, down: bool):
+        (self.mods.add if down else self.mods.discard)(tag)
+        self._dirty = True
+
+    def _on_oskey(self, base: str, down: bool):
         if self.source == "hid":
             return
         if not down:
-            pos = self.hook_held.pop(vk, None)
+            pos = self.hook_held.pop(base, None)
             if pos:
                 self.pressed_hook.discard(pos)
                 self._dirty = True
             return
-        if vk in self.hook_held:            # autorepeat
-            return
-        base = VK2KC.get(vk)
-        if not base:
+        if base in self.hook_held:          # autorepeat
             return
         names = []
         if "Sft" in self.mods and base in SHIFT_OF:
@@ -912,7 +1307,7 @@ class OverlayApp:
         if not found:
             return
         L, pos = found
-        self.hook_held[vk] = pos
+        self.hook_held[base] = pos
         self.pressed_hook.add(pos)
         if L:
             self.hook_layer = L
@@ -1061,6 +1456,33 @@ class OverlayApp:
 
 
 # ---------------------------------------------------------------- main ------
+def _read_pidfile() -> Optional[int]:
+    """PID of a live OverlayCorne instance, else None (Linux only)."""
+    try:
+        with open(pidfile_path(), "r", encoding="utf-8") as f:
+            pid = int(f.read().strip())
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmd = f.read().lower()
+        if b"overlaycorne" not in cmd and b"overlay_corne" not in cmd:
+            return None                    # PID was recycled by another app
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+def _send_control(args) -> int:
+    pid = _read_pidfile()
+    if pid is None:
+        print("no running OverlayCorne instance found")
+        return 1
+    for enabled, sig in ((args.toggle_lock, signal.SIGUSR1),
+                         (args.kb_unlock, signal.SIGUSR2),
+                         (args.stop, signal.SIGTERM)):
+        if enabled:
+            os.kill(pid, sig)
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="Vial Corne keyboard overlay")
     ap.add_argument("--vil", default=DEFAULT_VIL, help="path to .vil keymap")
@@ -1078,7 +1500,21 @@ def main():
                     help="ignore saved position, snap bottom-right")
     ap.add_argument("--list", action="store_true",
                     help="list raw HID devices and exit")
+    ap.add_argument("--toggle-lock", action="store_true",
+                    help="tell the running instance to toggle position lock "
+                         "(Linux)")
+    ap.add_argument("--kb-unlock", action="store_true",
+                    help="tell the running instance to start the Vial unlock "
+                         "handshake (Linux)")
+    ap.add_argument("--stop", action="store_true",
+                    help="quit the running instance (Linux)")
     args = ap.parse_args()
+
+    if args.toggle_lock or args.kb_unlock or args.stop:
+        if IS_WINDOWS:
+            print("control verbs are Linux-only — use the global hotkeys")
+            sys.exit(2)
+        sys.exit(_send_control(args))
 
     if args.list:
         if hid is None:
@@ -1094,17 +1530,57 @@ def main():
         print(f"keymap not found: {args.vil}")
         sys.exit(1)
 
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(2)
-    except Exception:
+    # Wayland-proof "hotkeys": always available, no permissions needed.
+    # ctl["q"] is filled in once the app exists; until then USR1/USR2 are
+    # ignored and TERM/INT exit hard.  A second quit signal (or one arriving
+    # while the Tk pump is dead) also exits hard, so Ctrl+C always works.
+    ctl = {"q": None, "quits": 0}
+
+    def _hk_signal(hk):
+        def handler(signum, frame):
+            if hk == HK_QUIT:
+                ctl["quits"] += 1
+                if ctl["q"] is None or ctl["quits"] > 1:
+                    try:
+                        os.remove(pidfile_path())
+                    except OSError:
+                        pass
+                    os._exit(130)
+            if ctl["q"] is not None:
+                ctl["q"].put(("hotkey", hk))
+        return handler
+
+    if not IS_WINDOWS:
+        pid = _read_pidfile()
+        if pid is not None:
+            print(f"OverlayCorne is already running (pid {pid}) — control it "
+                  "with --toggle-lock / --kb-unlock / --stop")
+            sys.exit(0)      # expected condition; keep systemd Restart= calm
+        # handlers must be live BEFORE the pidfile advertises this PID, or a
+        # control verb arriving mid-startup would hit the default
+        # disposition of SIGUSR1/SIGUSR2 and terminate the process
+        signal.signal(signal.SIGUSR1, _hk_signal(HK_LOCK))
+        signal.signal(signal.SIGUSR2, _hk_signal(HK_UNLOCK))
+        signal.signal(signal.SIGTERM, _hk_signal(HK_QUIT))
+        signal.signal(signal.SIGINT, _hk_signal(HK_QUIT))
         try:
-            user32.SetProcessDPIAware()
-        except Exception:
+            with open(pidfile_path(), "w", encoding="utf-8") as f:
+                f.write(str(os.getpid()))
+        except OSError:
             pass
 
-    km = Keymap(args.vil)
-    app = OverlayApp(km, args)
-    app.run()
+    try:
+        BACKEND.set_dpi_awareness()
+        km = Keymap(args.vil)
+        app = OverlayApp(km, args)
+        ctl["q"] = app.q
+        app.run()
+    finally:
+        if not IS_WINDOWS:
+            try:
+                os.remove(pidfile_path())
+            except OSError:
+                pass
     os._exit(0)
 
 
